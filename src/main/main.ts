@@ -33,6 +33,9 @@ import { getSkillServiceManager } from './skillServices';
 import { createTray, destroyTray, updateTrayMenu } from './trayManager';
 import { isAutoLaunched, getAutoLaunchEnabled, setAutoLaunchEnabled } from './autoLaunchManager';
 import { McpStore } from './mcpStore';
+import { McpServerManager } from './libs/mcpServerManager';
+import { McpBridgeServer } from './libs/mcpBridgeServer';
+import type { McpBridgeConfig } from './libs/openclawConfigSync';
 import { ScheduledTaskStore } from './scheduledTaskStore';
 import { Scheduler } from './libs/scheduler';
 import { downloadUpdate, installUpdate, cancelActiveDownload } from './libs/appUpdateInstaller';
@@ -523,6 +526,10 @@ let openClawRuntimeAdapter: OpenClawRuntimeAdapter | null = null;
 let coworkEngineRouter: CoworkEngineRouter | null = null;
 let skillManager: SkillManager | null = null;
 let mcpStore: McpStore | null = null;
+let mcpServerManager: McpServerManager | null = null;
+let mcpBridgeServer: McpBridgeServer | null = null;
+let mcpBridgeSecret: string | null = null;
+let mcpBridgeStartPromise: Promise<McpBridgeConfig | null> | null = null;
 let imGatewayManager: IMGatewayManager | null = null;
 let scheduledTaskStore: ScheduledTaskStore | null = null;
 let scheduler: Scheduler | null = null;
@@ -608,6 +615,15 @@ const bootstrapOpenClawEngine = async (options: { forceReinstall?: boolean; reas
     const elapsed = () => `${Date.now() - t0}ms`;
     try {
       console.log(`[OpenClaw] bootstrap starting (reason=${reason})`);
+
+      // Start MCP Bridge before config sync so mcpBridge tools are included in openclaw.json
+      const bridgeResult = await startMcpBridge().catch((err: unknown) => {
+        console.error(`[OpenClaw] bootstrap: MCP bridge startup failed (non-fatal):`, err);
+        return null as McpBridgeConfig | null;
+      });
+      console.log(`[OpenClaw] bootstrap: MCP bridge setup done (${elapsed()}), result=${bridgeResult ? `${bridgeResult.tools.length} tools` : 'null'}`);
+      console.log(`[OpenClaw] bootstrap: mcpBridgeServer=${mcpBridgeServer?.callbackUrl || 'null'}, mcpServerManager.tools=${mcpServerManager?.toolManifest?.length ?? 'null'}, secret=${mcpBridgeSecret ? 'set' : 'null'}`);
+
       const syncResult = await syncOpenClawConfig({
         reason: `bootstrap:${reason}`,
         restartGatewayIfRunning: false,
@@ -652,6 +668,20 @@ const ensureOpenClawRunningForCowork = async () => {
   if (status.phase === 'starting') {
     return status;
   }
+
+  // Ensure MCP bridge is started and config is synced before launching the gateway,
+  // so that mcpBridge tools are available in openclaw.json when the gateway loads.
+  await startMcpBridge().catch((err: unknown) => {
+    console.error('[OpenClaw] ensureRunning: MCP bridge startup failed (non-fatal):', err);
+  });
+  const syncResult = await syncOpenClawConfig({
+    reason: 'ensureRunning:mcpBridge',
+    restartGatewayIfRunning: false,
+  });
+  if (!syncResult.success) {
+    console.error('[OpenClaw] ensureRunning: config sync failed:', syncResult.error);
+  }
+
   return await manager.startGateway();
 };
 
@@ -718,6 +748,16 @@ const getOpenClawConfigSync = (): OpenClawConfigSync => {
         } catch {
           return null;
         }
+      },
+      getMcpBridgeConfig: (): McpBridgeConfig | null => {
+        if (!mcpBridgeServer?.callbackUrl || !mcpServerManager?.toolManifest?.length || !mcpBridgeSecret) {
+          return null;
+        }
+        return {
+          callbackUrl: mcpBridgeServer.callbackUrl,
+          secret: mcpBridgeSecret,
+          tools: mcpServerManager.toolManifest,
+        };
       },
     });
   }
@@ -896,6 +936,136 @@ const getMcpStore = () => {
     mcpStore = new McpStore(sqliteStore.getDatabase(), sqliteStore.getSaveFunction());
   }
   return mcpStore;
+};
+
+/**
+ * Start the MCP Bridge: server manager + HTTP callback.
+ * Called during OpenClaw bootstrap before config sync.
+ * Returns the bridge config to be written into openclaw.json.
+ */
+const startMcpBridge = (): Promise<McpBridgeConfig | null> => {
+  // Deduplicate concurrent calls — only one initialization at a time
+  if (mcpBridgeStartPromise) {
+    return mcpBridgeStartPromise;
+  }
+  mcpBridgeStartPromise = (async (): Promise<McpBridgeConfig | null> => {
+  try {
+    console.log('[McpBridge] startMcpBridge called');
+    const enabledServers = getMcpStore().getEnabledServers();
+    console.log(`[McpBridge] enabledServers: ${enabledServers.length} (${enabledServers.map(s => s.name).join(', ')})`);
+    if (enabledServers.length === 0) {
+      console.log('[McpBridge] no enabled MCP servers, skipping bridge startup');
+      return null;
+    }
+
+    // Generate a per-session secret for bridge auth
+    if (!mcpBridgeSecret) {
+      const crypto = await import('crypto');
+      mcpBridgeSecret = crypto.randomUUID();
+    }
+    console.log('[McpBridge] secret generated');
+
+    // Start server manager and discover tools
+    if (!mcpServerManager) {
+      mcpServerManager = new McpServerManager();
+    }
+    console.log('[McpBridge] starting MCP servers...');
+    const tools = await mcpServerManager.startServers(enabledServers);
+    console.log(`[McpBridge] tools discovered: ${tools.length}`);
+    if (tools.length === 0) {
+      console.log('[McpBridge] no tools discovered from MCP servers');
+      return null;
+    }
+
+    // Start HTTP callback server
+    if (!mcpBridgeServer) {
+      mcpBridgeServer = new McpBridgeServer(mcpServerManager, mcpBridgeSecret);
+    }
+    if (!mcpBridgeServer.port) {
+      console.log('[McpBridge] starting HTTP callback server...');
+      await mcpBridgeServer.start();
+    }
+
+    const callbackUrl = mcpBridgeServer.callbackUrl;
+    if (!callbackUrl) {
+      console.error('[McpBridge] failed to get callback URL');
+      return null;
+    }
+
+    console.log(`[McpBridge] started: ${tools.length} tools, callback=${callbackUrl}`);
+    return { callbackUrl, secret: mcpBridgeSecret, tools };
+  } catch (error) {
+    console.error('[McpBridge] startup error:', error instanceof Error ? error.stack || error.message : String(error));
+    return null;
+  }
+  })().finally(() => {
+    mcpBridgeStartPromise = null;
+  });
+  return mcpBridgeStartPromise;
+};
+
+/**
+ * Stop the MCP Bridge: server manager + HTTP callback.
+ */
+const stopMcpBridge = async (): Promise<void> => {
+  try {
+    if (mcpServerManager) {
+      await mcpServerManager.stopServers();
+    }
+    if (mcpBridgeServer) {
+      await mcpBridgeServer.stop();
+    }
+  } catch (error) {
+    console.error('[McpBridge] shutdown error:', error instanceof Error ? error.message : String(error));
+  }
+};
+
+/**
+ * Refresh the MCP Bridge after server config changes:
+ * stop existing MCP servers → restart with new config → sync openclaw.json → restart gateway.
+ * Returns a summary for the renderer to display.
+ */
+let mcpBridgeRefreshPromise: Promise<{ tools: number; error?: string }> | null = null;
+
+const refreshMcpBridge = (): Promise<{ tools: number; error?: string }> => {
+  if (mcpBridgeRefreshPromise) {
+    return mcpBridgeRefreshPromise;
+  }
+  mcpBridgeRefreshPromise = (async () => {
+    try {
+      console.log('[McpBridge] refreshing after config change...');
+
+      // 1. Stop existing MCP servers (but keep HTTP callback server alive — port stays the same)
+      if (mcpServerManager) {
+        await mcpServerManager.stopServers();
+      }
+
+      // 2. Re-discover tools from the new set of enabled servers
+      const bridgeConfig = await startMcpBridge();
+      const toolCount = bridgeConfig?.tools.length ?? 0;
+      console.log(`[McpBridge] refresh: ${toolCount} tools discovered`);
+
+      // 3. Sync openclaw.json and restart gateway if running
+      const syncResult = await syncOpenClawConfig({
+        reason: 'mcp-server-changed',
+        restartGatewayIfRunning: true,
+      });
+      if (!syncResult.success) {
+        console.error('[McpBridge] refresh: config sync failed:', syncResult.error);
+        return { tools: toolCount, error: syncResult.error };
+      }
+
+      console.log(`[McpBridge] refresh complete: ${toolCount} tools, gateway restarted=${syncResult.changed}`);
+      return { tools: toolCount };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error('[McpBridge] refresh error:', msg);
+      return { tools: 0, error: msg };
+    }
+  })().finally(() => {
+    mcpBridgeRefreshPromise = null;
+  });
+  return mcpBridgeRefreshPromise;
 };
 
 const getIMGatewayManager = () => {
@@ -1453,7 +1623,7 @@ if (!gotTheLock) {
     }
   });
 
-  ipcMain.handle('mcp:create', (_event, data: {
+  ipcMain.handle('mcp:create', async (_event, data: {
     name: string;
     description: string;
     transportType: string;
@@ -1466,13 +1636,15 @@ if (!gotTheLock) {
     try {
       getMcpStore().createServer(data as any);
       const servers = getMcpStore().listServers();
+      // Trigger async MCP bridge refresh (don't await — let UI show DB result immediately)
+      refreshMcpBridge().catch(err => console.error('[McpBridge] background refresh error:', err));
       return { success: true, servers };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to create MCP server' };
     }
   });
 
-  ipcMain.handle('mcp:update', (_event, id: string, data: {
+  ipcMain.handle('mcp:update', async (_event, id: string, data: {
     name?: string;
     description?: string;
     transportType?: string;
@@ -1485,26 +1657,29 @@ if (!gotTheLock) {
     try {
       getMcpStore().updateServer(id, data as any);
       const servers = getMcpStore().listServers();
+      refreshMcpBridge().catch(err => console.error('[McpBridge] background refresh error:', err));
       return { success: true, servers };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to update MCP server' };
     }
   });
 
-  ipcMain.handle('mcp:delete', (_event, id: string) => {
+  ipcMain.handle('mcp:delete', async (_event, id: string) => {
     try {
       getMcpStore().deleteServer(id);
       const servers = getMcpStore().listServers();
+      refreshMcpBridge().catch(err => console.error('[McpBridge] background refresh error:', err));
       return { success: true, servers };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to delete MCP server' };
     }
   });
 
-  ipcMain.handle('mcp:setEnabled', (_event, options: { id: string; enabled: boolean }) => {
+  ipcMain.handle('mcp:setEnabled', async (_event, options: { id: string; enabled: boolean }) => {
     try {
       getMcpStore().setEnabled(options.id, options.enabled);
       const servers = getMcpStore().listServers();
+      refreshMcpBridge().catch(err => console.error('[McpBridge] background refresh error:', err));
       return { success: true, servers };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to update MCP server' };
@@ -1542,6 +1717,16 @@ if (!gotTheLock) {
       return { success: true, data: marketplace };
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to fetch marketplace' };
+    }
+  });
+
+  // Explicit bridge refresh — renderer can await this for loading state
+  ipcMain.handle('mcp:refreshBridge', async () => {
+    try {
+      const result = await refreshMcpBridge();
+      return { success: true, tools: result.tools, error: result.error };
+    } catch (error) {
+      return { success: false, tools: 0, error: error instanceof Error ? error.message : 'Failed to refresh MCP bridge' };
     }
   });
 
@@ -3078,6 +3263,11 @@ if (!gotTheLock) {
         console.error('[OpenClaw] Failed to stop gateway on quit:', error);
       });
     }
+
+    // Stop MCP Bridge (servers + HTTP callback)
+    await stopMcpBridge().catch((error) => {
+      console.error('[McpBridge] Failed to stop on quit:', error);
+    });
 
     // Stop the scheduler
     if (scheduler) {
