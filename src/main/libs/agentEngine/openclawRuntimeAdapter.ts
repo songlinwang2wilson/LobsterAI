@@ -765,6 +765,10 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         if (!isChannel) continue;
         // Skip keys that were explicitly deleted by the user — only real-time events re-create them
         if (this.deletedChannelKeys.has(key)) continue;
+        // Skip gateway sessions belonging to a previously-bound agent.
+        // After an agent binding change, the gateway retains old sessions under the old agentId.
+        // Only process sessions matching the current platformAgentBindings.
+        if (!this.channelSessionSync.isCurrentBindingKey(key)) continue;
         channelCount++;
         // Use resolveOrCreateSession so new channel sessions are auto-created
         const sessionId = this.channelSessionSync.resolveOrCreateSession(key);
@@ -774,19 +778,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           hasNew = true;
           // Queue full history sync for newly discovered sessions
           if (!this.fullySyncedSessions.has(sessionId)) {
-            // Sessions created due to agent binding change should NOT pull old history.
-            // The gateway still holds the full conversation from the previous agent — syncing
-            // it would pollute the new agent's session with irrelevant messages.
-            // Instead, mark as synced and initialize cursor to current history length
-            // so only messages arriving after the binding change are picked up.
-            if (this.channelSessionSync.popAgentChangedSession(sessionId)) {
-              console.log('[ChannelSync] agent-changed session, skipping full history sync:', sessionId);
-              this.fullySyncedSessions.add(sessionId);
-              // Initialize cursor by fetching current history length so only future messages sync
-              this.initAgentChangedCursor(sessionId, key);
-            } else {
-              newSessionsToSync.push({ sessionId, sessionKey: key });
-            }
+            newSessionsToSync.push({ sessionId, sessionKey: key });
           }
         }
       }
@@ -815,13 +807,11 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           if (!this.channelSessionSync.isChannelSessionKey(key)) continue;
           if (this.deletedChannelKeys.has(key)) continue;
           if (this.heartbeatSessionKeys.has(key)) continue;
+          // Skip sessions belonging to a previously-bound agent
+          if (!this.channelSessionSync.isCurrentBindingKey(key)) continue;
           const sessionId = this.sessionIdBySessionKey.get(key);
           if (!sessionId || !this.fullySyncedSessions.has(sessionId)) continue;
-          // Deduplicate: only sync each sessionId once per poll cycle.
-          // After an agent binding change, the gateway may return both the old key
-          // (agent:old:channel:conv) and the new key (agent:new:channel:conv), both
-          // resolving to the same local sessionId. Without dedup, incrementalChannelSync
-          // would run twice for the same session, causing duplicate messages.
+          // Safety net: only sync each sessionId once per poll cycle
           if (syncedThisCycle.has(sessionId)) continue;
           syncedThisCycle.add(sessionId);
           // Skip sessions with an active turn (they handle their own sync)
@@ -2847,12 +2837,19 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       if (historyEntries.length > 0) {
         const lastUser = [...historyEntries].reverse().find((entry) => entry.role === 'user');
         if (lastUser) {
-          const userMessage = this.store.addMessage(sessionId, {
-            type: 'user',
-            content: lastUser.text,
-            metadata: {},
-          });
-          this.emit('message', sessionId, userMessage);
+          // Dedup: skip if this message already exists locally
+          const session = this.store.getSession(sessionId);
+          const alreadyExists = session?.messages.some(
+            (m: CoworkMessage) => m.type === 'user' && m.content.trim() === lastUser.text,
+          ) ?? false;
+          if (!alreadyExists) {
+            const userMessage = this.store.addMessage(sessionId, {
+              type: 'user',
+              content: lastUser.text,
+              metadata: {},
+            });
+            this.emit('message', sessionId, userMessage);
+          }
         }
       }
       this.channelSyncCursor.set(sessionId, historyEntries.length);
@@ -2891,9 +2888,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     }
 
     const userIndicesToSync: number[] = [];
-    // Normal range: from firstNewIdx onwards
+    // Normal range: from firstNewIdx onwards, with dedup against local messages
     for (let i = firstNewIdx; i < historyEntries.length; i++) {
-      if (historyEntries[i].role === 'user') {
+      if (historyEntries[i].role === 'user' && !localUserTexts.has(historyEntries[i].text)) {
         userIndicesToSync.push(i);
       }
     }
@@ -2963,25 +2960,6 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
    *
    * Uses position-based matching to avoid false dedup of identical-content messages.
    */
-  /**
-   * Initialize the sync cursor for a session created by agent binding change.
-   * Fetches the current gateway history length so only future messages are picked up.
-   */
-  private async initAgentChangedCursor(sessionId: string, sessionKey: string): Promise<void> {
-    try {
-      const client = this.gatewayClient;
-      if (!client) return;
-      const history = await client.request<{ messages?: unknown[] }>('chat.history', {
-        sessionKey,
-        limit: FINAL_HISTORY_SYNC_LIMIT,
-      });
-      const count = Array.isArray(history?.messages) ? history.messages.length : 0;
-      this.channelSyncCursor.set(sessionId, count);
-      console.log('[ChannelSync] initAgentChangedCursor: set cursor to', count, 'for session', sessionId);
-    } catch (err) {
-      console.warn('[ChannelSync] initAgentChangedCursor failed:', err);
-    }
-  }
 
   private async syncFullChannelHistory(sessionId: string, sessionKey: string): Promise<void> {
     if (this.fullySyncedSessions.has(sessionId)) return;

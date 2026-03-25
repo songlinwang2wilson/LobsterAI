@@ -146,6 +146,18 @@ export function parseChannelSessionKey(sessionKey: string): { platform: IMPlatfo
   return { platform, conversationId };
 }
 
+/**
+ * Extract the agentId from a gateway session key.
+ * Key format: "agent:{agentId}:{channel}:..." → returns agentId.
+ * Returns null for legacy keys or non-agent keys.
+ */
+export function extractAgentIdFromKey(sessionKey: string): string | null {
+  if (!sessionKey.startsWith('agent:')) return null;
+  const secondColon = sessionKey.indexOf(':', 6); // skip "agent:"
+  if (secondColon <= 6) return null;
+  return sessionKey.slice(6, secondColon);
+}
+
 /** Match OpenClaw main agent session keys like "agent:main:main" or "agent:secondary:main". */
 const MAIN_AGENT_SESSION_RE = /^agent:[^:]+:main$/;
 
@@ -201,7 +213,11 @@ export class OpenClawChannelSessionSync {
   /** Keys that have been tried and are not recognized — avoids repeated log noise. */
   private readonly rejectedKeys = new Set<string>();
 
-  /** Sessions created due to agent binding change — should skip full history sync. */
+  /**
+   * Sessions created because the agent binding changed.
+   * These should skip syncFullChannelHistory to avoid pulling old gateway messages
+   * into the new session — only future incremental messages will appear.
+   */
   private readonly agentChangedSessionIds = new Set<string>();
 
   constructor(deps: ChannelSessionSyncDeps) {
@@ -212,11 +228,26 @@ export class OpenClawChannelSessionSync {
   }
 
   /**
-   * Check if a session was created due to an agent binding change.
-   * Consumes the flag (returns true only once per sessionId).
+   * Check if a gateway session key belongs to the agent currently bound to its platform.
+   * When users switch agent bindings, the gateway retains old sessions under the previous
+   * agentId. This method filters them out so only the current agent's sessions are processed.
    */
-  popAgentChangedSession(sessionId: string): boolean {
-    return this.agentChangedSessionIds.delete(sessionId);
+  isCurrentBindingKey(sessionKey: string): boolean {
+    const parsed = parseChannelSessionKey(sessionKey);
+    if (!parsed) return true; // Not a channel key — let other logic handle it
+    const keyAgentId = extractAgentIdFromKey(sessionKey);
+    if (!keyAgentId) return true; // Legacy key without agentId — allow
+    const imSettings = this.imStore.getIMSettings();
+    const currentAgentId = imSettings.platformAgentBindings?.[parsed.platform] || 'main';
+    return keyAgentId === currentAgentId;
+  }
+
+  /**
+   * Whether the session was created due to an agent binding change.
+   * Such sessions should skip full history sync — only future messages matter.
+   */
+  isAgentChangedSession(sessionId: string): boolean {
+    return this.agentChangedSessionIds.has(sessionId);
   }
 
   /**
@@ -258,14 +289,11 @@ export class OpenClawChannelSessionSync {
       const session = this.coworkStore.getSession(existingMapping.coworkSessionId);
       if (session) {
         // Check if the agent binding has changed since this mapping was created.
-        // Background: when platformAgentBindings changes (e.g. weixin: main → music-agent),
-        // the gateway returns a new sessionKey with the new agentId, but the old mapping
-        // still points to the old session. Without this check, both old and new keys would
-        // resolve to the same session, causing duplicate message syncs.
+        // When platformAgentBindings changes, the mapping's agentId becomes stale.
+        // Create a new session for the new agent and update the mapping.
         const imSettings = this.imStore.getIMSettings();
         const currentAgentId = imSettings.platformAgentBindings?.[parsed.platform] || 'main';
         if (existingMapping.agentId !== currentAgentId) {
-          // Agent binding changed → create a new session under the new agent
           console.log('[ChannelSessionSync] agent binding changed:', existingMapping.agentId, '→', currentAgentId, '— creating new session');
           const titlePrefix = CHANNEL_TITLE_PREFIX[parsed.platform] || `[${parsed.platform}]`;
           const displayId = parsed.conversationId.includes('@')
@@ -278,7 +306,8 @@ export class OpenClawChannelSessionSync {
           console.log('[ChannelSessionSync] created new session for agent change:', newSession.id);
           this.imStore.updateSessionMappingTarget(parsed.conversationId, parsed.platform, newSession.id, currentAgentId);
           this.syncedSessionKeys.set(sessionKey, newSession.id);
-          // Mark so the adapter skips full history sync for this session
+          // Mark so pollChannelSessions skips full history sync for this session —
+          // old gateway messages should not be pulled into the new session.
           this.agentChangedSessionIds.add(newSession.id);
           return newSession.id;
         }
