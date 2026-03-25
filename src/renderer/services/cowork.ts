@@ -146,17 +146,19 @@ class CoworkService {
     const errorCleanup = cowork.onStreamError(({ sessionId, error }) => {
       store.dispatch(updateSessionStatus({ sessionId, status: 'error' }));
       // Surface the error as a visible message so the user knows what happened.
-      if (error) {
-        store.dispatch(addMessage({
-          sessionId,
-          message: {
-            id: `error-${Date.now()}`,
-            type: 'system',
-            content: classifyError(error),
-            timestamp: Date.now(),
-          },
-        }));
-      }
+      const errorContent = error
+        ? classifyError(error)
+        : i18nService.t('errorOccurred');
+      console.error('[CoworkService] Stream error:', { sessionId, rawError: error, displayError: errorContent });
+      store.dispatch(addMessage({
+        sessionId,
+        message: {
+          id: `error-${Date.now()}`,
+          type: 'system',
+          content: errorContent,
+          timestamp: Date.now(),
+        },
+      }));
     });
     this.streamListenerCleanups.push(errorCleanup);
 
@@ -304,7 +306,6 @@ class CoworkService {
           }));
         }
       }
-      // Show a user-visible error message in the session
       if (result.error) {
         const errorContent = result.code === 'ENGINE_NOT_READY'
           ? i18nService.t('coworkErrorEngineNotReady')
