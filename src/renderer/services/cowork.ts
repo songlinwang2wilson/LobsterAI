@@ -91,7 +91,7 @@ class CoworkService {
       const sessionExists = state.sessions.some(s => s.id === sessionId);
 
       console.log('[CoworkService] onStreamMessage: sessionId=', sessionId, 'type=', message.type, 'sessionExists=', sessionExists, 'totalSessions=', state.sessions.length);
-      if (!sessionExists) {
+      if (!sessionExists && !sessionId.startsWith('temp-')) {
         // Session was created by IM or another source, refresh the session list
         console.log('[CoworkService] onStreamMessage: session NOT found in Redux, calling loadSessions...');
         await this.loadSessions();
@@ -246,7 +246,9 @@ class CoworkService {
 
     const result = await cowork.startSession(options);
     if (result.success && result.session) {
-      store.dispatch(addSession(result.session));
+      if (!options.isTemp) {
+        store.dispatch(addSession(result.session));
+      }
       if (result.session.status !== 'running') {
         store.dispatch(setStreaming(false));
       }

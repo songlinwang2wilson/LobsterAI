@@ -435,6 +435,7 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
         systemPrompt: combinedSystemPrompt,
         activeSkillIds: sessionSkillIds,
         imageAttachments,
+        isTemp: true,
       });
 
       if (!startedSession && startError) {

@@ -363,6 +363,10 @@ const coworkSlice = createSlice({
 
     clearTempSession(state) {
       state.tempSession = null;
+      if (state.currentSession?.id && !state.sessions.some(s => s.id === state.currentSession!.id)) {
+        state.currentSession = null;
+        state.currentSessionId = null;
+      }
     },
   },
 });
