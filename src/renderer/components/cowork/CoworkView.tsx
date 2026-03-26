@@ -1,7 +1,7 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
-import { RootState } from '../../store';
-import { addMessage, clearCurrentSession, setCurrentSession, setStreaming, updateSessionStatus } from '../../store/slices/coworkSlice';
+import { RootState, store } from '../../store';
+import { addMessage, clearCurrentSession, setCurrentSession, setStreaming, updateSessionStatus, setTempSession, clearTempSession } from '../../store/slices/coworkSlice';
 import { clearActiveSkills, setActiveSkillIds } from '../../store/slices/skillSlice';
 import { setActions, selectAction, clearSelection } from '../../store/slices/quickActionSlice';
 import { coworkService } from '../../services/cowork';
@@ -46,6 +46,7 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
     currentSession,
     isStreaming,
     config,
+    tempSession,
   } = useSelector((state: RootState) => state.cowork);
   const isOpenClawEngine = config.agentEngine !== 'yd_cowork';
 
@@ -295,7 +296,8 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
   };
 
   const handleContinueSession = async (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[]) => {
-    if (!currentSession) return;
+    const activeSession = currentSession ?? tempSession;
+    if (!activeSession) return;
     if (isOpenClawEngine && openClawStatus && !isOpenClawReadyForSession(openClawStatus)) {
       window.dispatchEvent(new CustomEvent('app:showToast', { detail: i18nService.t('coworkErrorEngineNotReady') }));
       return false;
@@ -308,16 +310,12 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
       imageAttachmentsBase64Lengths: imageAttachments?.map(a => a.base64Data.length),
     });
 
-    // Capture active skill IDs before clearing
     const sessionSkillIds = [...activeSkillIds];
 
-    // Clear active skills after capturing so they don't persist to next message
     if (sessionSkillIds.length > 0) {
       dispatch(clearActiveSkills());
     }
 
-    // Combine skill prompt with system prompt for continuation.
-    // Skip auto-routing prompt for OpenClaw — skills are loaded natively.
     let effectiveSkillPrompt = skillPrompt;
     if (!skillPrompt && !isOpenClawEngine) {
       effectiveSkillPrompt = await skillService.getAutoRoutingPrompt() || undefined;
@@ -327,7 +325,7 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
       .join('\n\n') || undefined;
 
     await coworkService.continueSession({
-      sessionId: currentSession.id,
+      sessionId: activeSession.id,
       prompt,
       systemPrompt: combinedSystemPrompt,
       activeSkillIds: sessionSkillIds.length > 0 ? sessionSkillIds : undefined,
@@ -336,11 +334,149 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
   };
 
   const handleStopSession = async () => {
-    if (!currentSession) return;
-    if (currentSession.id.startsWith('temp-') && pendingStartRef.current) {
+    const activeSession = currentSession ?? tempSession;
+    if (!activeSession) return;
+    if (activeSession.id.startsWith('temp-') && pendingStartRef.current) {
       pendingStartRef.current.cancelled = true;
     }
-    await coworkService.stopSession(currentSession.id);
+    await coworkService.stopSession(activeSession.id);
+  };
+
+  const handleStartTempSession = useCallback(() => {
+    dispatch(clearCurrentSession());
+    const now = Date.now();
+    dispatch(setTempSession({
+      id: `temp-ephemeral-${now}`,
+      title: i18nService.t('tempSession'),
+      claudeSessionId: null,
+      status: 'idle',
+      pinned: false,
+      cwd: config.workingDirectory || '',
+      systemPrompt: '',
+      executionMode: config.executionMode || 'local',
+      activeSkillIds: [],
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
+    }));
+  }, [dispatch, config.workingDirectory, config.executionMode]);
+
+  const handleStartTempChat = async (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[]): Promise<boolean | void> => {
+    if (isStartingRef.current) return;
+    isStartingRef.current = true;
+    const requestId = ++startRequestIdRef.current;
+    pendingStartRef.current = { requestId, cancelled: false };
+    const isPendingStartCancelled = () => {
+      const pending = pendingStartRef.current;
+      return !pending || pending.requestId !== requestId || pending.cancelled;
+    };
+
+    try {
+      try {
+        const apiConfig = await coworkService.checkApiConfig();
+        if (apiConfig && !apiConfig.hasConfig) {
+          onRequestAppSettings?.({ initialTab: 'model', notice: buildApiConfigNotice(apiConfig.error) });
+          isStartingRef.current = false;
+          return;
+        }
+      } catch (error) {
+        console.error('Failed to check cowork API config:', error);
+      }
+
+      const now = Date.now();
+      const fallbackTitle = prompt.split('\n')[0].slice(0, 50) || i18nService.t('tempSession');
+      const sessionSkillIds = [...activeSkillIds];
+
+      const tempEphemeralId = `temp-ephemeral-${now}`;
+      const updatedTempSession: CoworkSession = {
+        id: tempEphemeralId,
+        title: fallbackTitle,
+        claudeSessionId: null,
+        status: 'running',
+        pinned: false,
+        createdAt: now,
+        updatedAt: now,
+        cwd: config.workingDirectory || '',
+        systemPrompt: '',
+        executionMode: config.executionMode || 'local',
+        activeSkillIds: sessionSkillIds,
+        messages: [
+          {
+            id: `msg-${now}`,
+            type: 'user',
+            content: prompt,
+            timestamp: now,
+            metadata: (sessionSkillIds.length > 0 || (imageAttachments && imageAttachments.length > 0))
+              ? {
+                ...(sessionSkillIds.length > 0 ? { skillIds: sessionSkillIds } : {}),
+                ...(imageAttachments && imageAttachments.length > 0 ? { imageAttachments } : {}),
+              }
+              : undefined,
+          },
+        ],
+      };
+      dispatch(setTempSession(updatedTempSession));
+      dispatch(setStreaming(true));
+      dispatch(clearActiveSkills());
+      dispatch(clearSelection());
+
+      let effectiveSkillPrompt = skillPrompt;
+      if (!skillPrompt) {
+        effectiveSkillPrompt = await skillService.getAutoRoutingPrompt() || undefined;
+      }
+      const combinedSystemPrompt = [effectiveSkillPrompt, config.systemPrompt]
+        .filter(p => p?.trim())
+        .join('\n\n') || undefined;
+
+      const { session: startedSession, error: startError } = await coworkService.startSession({
+        prompt,
+        title: fallbackTitle,
+        cwd: config.workingDirectory || undefined,
+        systemPrompt: combinedSystemPrompt,
+        activeSkillIds: sessionSkillIds,
+        imageAttachments,
+      });
+
+      if (!startedSession && startError) {
+        dispatch(addMessage({
+          sessionId: tempEphemeralId,
+          message: {
+            id: `error-${Date.now()}`,
+            type: 'system',
+            content: i18nService.t('coworkErrorSessionStartFailed').replace('{error}', startError),
+            timestamp: Date.now(),
+          },
+        }));
+        dispatch(updateSessionStatus({ sessionId: tempEphemeralId, status: 'error' }));
+        return;
+      }
+
+      if (startedSession) {
+        dispatch(setTempSession({
+          ...updatedTempSession,
+          id: startedSession.id,
+          claudeSessionId: startedSession.claudeSessionId,
+        }));
+      }
+
+      if (isPendingStartCancelled() && startedSession) {
+        await coworkService.stopSession(startedSession.id);
+      }
+    } finally {
+      if (pendingStartRef.current?.requestId === requestId) {
+        pendingStartRef.current = null;
+      }
+      isStartingRef.current = false;
+    }
+  };
+
+  const handleStopTempSession = async () => {
+    const currentTempId = store.getState().cowork.tempSession?.id;
+    if (!currentTempId) return;
+    if (pendingStartRef.current) {
+      pendingStartRef.current.cancelled = true;
+    }
+    await coworkService.stopSession(currentTempId);
   };
 
   // Get selected quick action
@@ -382,6 +518,7 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
   useEffect(() => {
     const handleNewSession = () => {
       dispatch(clearCurrentSession());
+      dispatch(clearTempSession());
       dispatch(clearSelection());
       window.dispatchEvent(new CustomEvent('cowork:focus-input', {
         detail: { clear: true },
@@ -392,6 +529,16 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
       window.removeEventListener('cowork:shortcut:new-session', handleNewSession);
     };
   }, [dispatch]);
+
+  useEffect(() => {
+    const handleOpenTempSession = () => {
+      handleStartTempSession();
+    };
+    window.addEventListener('cowork:open-temp-session', handleOpenTempSession);
+    return () => {
+      window.removeEventListener('cowork:open-temp-session', handleOpenTempSession);
+    };
+  }, [handleStartTempSession]);
 
   useEffect(() => {
     if (!isOpenClawEngine) return;
@@ -491,7 +638,24 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
     </div>
   ) : null;
 
-  // When there's a current session, show the session detail view
+  if (tempSession) {
+    return (
+      <div className="flex-1 flex flex-col h-full">
+        {engineStatusBanner}
+        <CoworkSessionDetail
+          onManageSkills={() => onShowSkills?.()}
+          onContinue={tempSession.messages.length === 0 ? handleStartTempChat : handleContinueSession}
+          onStop={handleStopTempSession}
+          onNavigateHome={() => dispatch(clearTempSession())}
+          isSidebarCollapsed={isSidebarCollapsed}
+          onToggleSidebar={onToggleSidebar}
+          onNewChat={onNewChat}
+          updateBadge={updateBadge}
+        />
+      </div>
+    );
+  }
+
   if (currentSession) {
     return (
       <div className="flex-1 flex flex-col h-full">
