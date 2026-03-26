@@ -165,6 +165,7 @@ const coworkSlice = createSlice({
     },
 
     addSession(state, action: PayloadAction<CoworkSession>) {
+      if (action.payload.id.startsWith('temp-')) return;
       const summary: CoworkSessionSummary = {
         id: action.payload.id,
         title: action.payload.title,

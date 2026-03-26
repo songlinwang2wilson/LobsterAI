@@ -210,7 +210,8 @@ class CoworkService {
       if (requestId !== this.latestLoadSessionsRequestId) {
         return;
       }
-      store.dispatch(setSessions(result.sessions));
+      const filtered = result.sessions.filter(s => !s.id.startsWith('temp-'));
+      store.dispatch(setSessions(filtered));
     }
   }
 
