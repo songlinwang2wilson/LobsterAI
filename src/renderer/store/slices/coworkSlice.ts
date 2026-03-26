@@ -131,7 +131,8 @@ const coworkSlice = createSlice({
       state.currentSession = action.payload;
       if (action.payload) {
         state.currentSessionId = action.payload.id;
-        if (!action.payload.id.startsWith('temp-')) {
+        const isTempId = state.tempSession && state.tempSession.id === action.payload.id;
+        if (!isTempId) {
           const { id, title, status, pinned, createdAt, updatedAt } = action.payload;
           const summary: CoworkSessionSummary = {
             id,
@@ -165,7 +166,7 @@ const coworkSlice = createSlice({
     },
 
     addSession(state, action: PayloadAction<CoworkSession>) {
-      if (action.payload.id.startsWith('temp-')) return;
+      if (state.tempSession && state.tempSession.id === action.payload.id) return;
       const summary: CoworkSessionSummary = {
         id: action.payload.id,
         title: action.payload.title,
@@ -363,10 +364,14 @@ const coworkSlice = createSlice({
     },
 
     clearTempSession(state) {
+      const tempId = state.tempSession?.id;
       state.tempSession = null;
-      if (state.currentSession?.id && !state.sessions.some(s => s.id === state.currentSession!.id)) {
-        state.currentSession = null;
-        state.currentSessionId = null;
+      if (tempId) {
+        state.sessions = state.sessions.filter(s => s.id !== tempId);
+        if (state.currentSession?.id === tempId) {
+          state.currentSession = null;
+          state.currentSessionId = null;
+        }
       }
     },
   },
