@@ -45,6 +45,11 @@ class CoworkService {
   private openClawEngineListenerAttached = false;
   private latestLoadSessionsRequestId = 0;
   private latestLoadSessionRequestId = 0;
+  private _tempExcludeId: string | null = null;
+
+  clearTempExclude(): void {
+    this._tempExcludeId = null;
+  }
 
   async init(): Promise<void> {
     if (this.initialized) return;
@@ -91,7 +96,7 @@ class CoworkService {
       const sessionExists = state.sessions.some(s => s.id === sessionId);
 
       console.log('[CoworkService] onStreamMessage: sessionId=', sessionId, 'type=', message.type, 'sessionExists=', sessionExists, 'totalSessions=', state.sessions.length);
-      const isTempSession = state.tempSession?.id === sessionId;
+      const isTempSession = state.tempSession?.id === sessionId || this._tempExcludeId === sessionId;
       if (!sessionExists && !isTempSession) {
         // Session was created by IM or another source, refresh the session list
         console.log('[CoworkService] onStreamMessage: session NOT found in Redux, calling loadSessions...');
@@ -211,7 +216,8 @@ class CoworkService {
       if (requestId !== this.latestLoadSessionsRequestId) {
         return;
       }
-      const tempId = store.getState().cowork.tempSession?.id;
+      const tempId = store.getState().cowork.tempSession?.id ?? this._tempExcludeId;
+      if (tempId === '__pending__') return;
       const filtered = tempId
         ? result.sessions.filter(s => s.id !== tempId)
         : result.sessions;
@@ -247,11 +253,17 @@ class CoworkService {
       return { session: null, error: 'Cowork API not available' };
     }
 
+    if (options.isTemp) {
+      this._tempExcludeId = '__pending__';
+    }
+
     store.dispatch(setStreaming(true));
 
     const result = await cowork.startSession(options);
     if (result.success && result.session) {
-      if (!options.isTemp) {
+      if (options.isTemp) {
+        this._tempExcludeId = result.session.id;
+      } else {
         store.dispatch(addSession(result.session));
       }
       if (result.session.status !== 'running') {
@@ -262,6 +274,10 @@ class CoworkService {
 
     if (result.engineStatus) {
       this.notifyOpenClawStatus(result.engineStatus);
+    }
+
+    if (options.isTemp) {
+      this._tempExcludeId = null;
     }
 
     // Show a user-visible error when session start fails
