@@ -19,6 +19,10 @@ interface CoworkState {
   sessions: CoworkSessionSummary[];
   currentSessionId: string | null;
   currentSession: CoworkSession | null;
+  /** Total message count for the current session (used for pagination) */
+  messageTotal: number;
+  /** Whether there are older messages not yet loaded */
+  hasMoreMessages: boolean;
   draftPrompts: Record<string, string>;
   /** Keyed by draftKey (sessionId or '__home__'), stores pending attachments */
   draftAttachments: Record<string, DraftAttachment[]>;
@@ -34,6 +38,8 @@ const initialState: CoworkState = {
   sessions: [],
   currentSessionId: null,
   currentSession: null,
+  messageTotal: 0,
+  hasMoreMessages: false,
   draftPrompts: {},
   draftAttachments: {},
   unreadSessionIds: [],
@@ -127,6 +133,8 @@ const coworkSlice = createSlice({
 
     setCurrentSession(state, action: PayloadAction<CoworkSession | null>) {
       state.currentSession = action.payload;
+      state.messageTotal = action.payload?.messages?.length ?? 0;
+      state.hasMoreMessages = false;
       if (action.payload) {
         state.currentSessionId = action.payload.id;
         if (!action.payload.id.startsWith('temp-')) {
@@ -226,6 +234,7 @@ const coworkSlice = createSlice({
         if (!exists) {
           state.currentSession.messages.push(message);
           state.currentSession.updatedAt = message.timestamp;
+          state.messageTotal = Math.max(state.messageTotal, state.currentSession.messages.length);
         }
       }
 
@@ -236,6 +245,22 @@ const coworkSlice = createSlice({
       }
 
       markSessionUnread(state, sessionId);
+    },
+
+    prependMessages(state, action: PayloadAction<{ sessionId: string; messages: CoworkMessage[]; total: number }>) {
+      const { sessionId, messages, total } = action.payload;
+      if (state.currentSession?.id !== sessionId) return;
+
+      const existingIds = new Set(state.currentSession.messages.map((m) => m.id));
+      const newMessages = messages.filter((m) => !existingIds.has(m.id));
+      state.currentSession.messages = [...newMessages, ...state.currentSession.messages];
+      state.messageTotal = total;
+      state.hasMoreMessages = state.currentSession.messages.length < total;
+    },
+
+    setMessagePaginationState(state, action: PayloadAction<{ total: number; hasMore: boolean }>) {
+      state.messageTotal = action.payload.total;
+      state.hasMoreMessages = action.payload.hasMore;
     },
 
     updateMessageContent(state, action: PayloadAction<{ sessionId: string; messageId: string; content: string }>) {
@@ -324,6 +349,8 @@ const coworkSlice = createSlice({
       state.currentSession = null;
       state.isStreaming = false;
       state.remoteManaged = false;
+      state.messageTotal = 0;
+      state.hasMoreMessages = false;
     },
 
     setDraftAttachments(state, action: PayloadAction<{ draftKey: string; attachments: DraftAttachment[] }>) {
@@ -354,6 +381,8 @@ export const {
   deleteSession,
   deleteSessions,
   addMessage,
+  prependMessages,
+  setMessagePaginationState,
   updateMessageContent,
   setStreaming,
   setRemoteManaged,

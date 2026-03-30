@@ -795,15 +795,45 @@ export class CoworkStore {
   }
 
   private getSessionMessages(sessionId: string): CoworkMessage[] {
-    const rows = this.getAll<CoworkMessageRow>(`
-      SELECT id, type, content, metadata, created_at, sequence
-      FROM cowork_messages
-      WHERE session_id = ?
-      ORDER BY
-        COALESCE(sequence, created_at) ASC,
-        created_at ASC,
-        ROWID ASC
-    `, [sessionId]);
+    return this.getSessionMessagesPaginated(sessionId);
+  }
+
+  getSessionMessagesPaginated(sessionId: string, options: { limit?: number; offset?: number } = {}): CoworkMessage[] {
+    const limit = options.limit ?? 0;
+    const offset = options.offset ?? 0;
+
+    const sql = limit > 0
+      ? `
+        SELECT * FROM (
+          SELECT id, type, content, metadata, created_at, sequence
+          FROM cowork_messages
+          WHERE session_id = ?
+          ORDER BY
+            COALESCE(sequence, created_at) DESC,
+            created_at DESC,
+            ROWID DESC
+          LIMIT ? OFFSET ?
+        ) sub
+        ORDER BY
+          COALESCE(sequence, created_at) ASC,
+          created_at ASC,
+          ROWID ASC
+      `
+      : `
+        SELECT id, type, content, metadata, created_at, sequence
+        FROM cowork_messages
+        WHERE session_id = ?
+        ORDER BY
+          COALESCE(sequence, created_at) ASC,
+          created_at ASC,
+          ROWID ASC
+      `;
+
+    const params: (string | number | null)[] = limit > 0
+      ? [sessionId, limit, offset]
+      : [sessionId];
+
+    const rows = this.getAll<CoworkMessageRow>(sql, params);
 
     return rows.map(row => ({
       id: row.id,
@@ -812,6 +842,14 @@ export class CoworkStore {
       timestamp: row.created_at,
       metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
     }));
+  }
+
+  getSessionMessageCount(sessionId: string): number {
+    const result = this.db.exec(
+      'SELECT COUNT(*) as cnt FROM cowork_messages WHERE session_id = ?',
+      [sessionId],
+    );
+    return (result[0]?.values[0]?.[0] as number) || 0;
   }
 
   addMessage(sessionId: string, message: Omit<CoworkMessage, 'id' | 'timestamp'>): CoworkMessage {
@@ -994,35 +1032,32 @@ export class CoworkStore {
   // Config operations
   getConfig(): CoworkConfig {
     interface ConfigRow {
+      key: string;
       value: string;
     }
 
-    const workingDirRow = this.getOne<ConfigRow>('SELECT value FROM cowork_config WHERE key = ?', ['workingDirectory']);
-    const agentEngineRow = this.getOne<ConfigRow>('SELECT value FROM cowork_config WHERE key = ?', ['agentEngine']);
-    const memoryEnabledRow = this.getOne<ConfigRow>('SELECT value FROM cowork_config WHERE key = ?', ['memoryEnabled']);
-    const memoryImplicitUpdateEnabledRow = this.getOne<ConfigRow>('SELECT value FROM cowork_config WHERE key = ?', ['memoryImplicitUpdateEnabled']);
-    const memoryLlmJudgeEnabledRow = this.getOne<ConfigRow>('SELECT value FROM cowork_config WHERE key = ?', ['memoryLlmJudgeEnabled']);
-    const memoryGuardLevelRow = this.getOne<ConfigRow>('SELECT value FROM cowork_config WHERE key = ?', ['memoryGuardLevel']);
-    const memoryUserMemoriesMaxItemsRow = this.getOne<ConfigRow>('SELECT value FROM cowork_config WHERE key = ?', ['memoryUserMemoriesMaxItems']);
-
-    const normalizedAgentEngine = normalizeCoworkAgentEngineValue(agentEngineRow?.value);
+    const rows = this.getAll<ConfigRow>('SELECT key, value FROM cowork_config');
+    const configMap = new Map<string, string>();
+    for (const row of rows) {
+      configMap.set(row.key, row.value);
+    }
 
     return {
-      workingDirectory: workingDirRow?.value || getDefaultWorkingDirectory(),
+      workingDirectory: configMap.get('workingDirectory') || getDefaultWorkingDirectory(),
       systemPrompt: getDefaultSystemPrompt(),
       executionMode: 'local' as CoworkExecutionMode,
-      agentEngine: normalizedAgentEngine,
-      memoryEnabled: parseBooleanConfig(memoryEnabledRow?.value, DEFAULT_MEMORY_ENABLED),
+      agentEngine: normalizeCoworkAgentEngineValue(configMap.get('agentEngine')),
+      memoryEnabled: parseBooleanConfig(configMap.get('memoryEnabled'), DEFAULT_MEMORY_ENABLED),
       memoryImplicitUpdateEnabled: parseBooleanConfig(
-        memoryImplicitUpdateEnabledRow?.value,
+        configMap.get('memoryImplicitUpdateEnabled'),
         DEFAULT_MEMORY_IMPLICIT_UPDATE_ENABLED
       ),
       memoryLlmJudgeEnabled: parseBooleanConfig(
-        memoryLlmJudgeEnabledRow?.value,
+        configMap.get('memoryLlmJudgeEnabled'),
         DEFAULT_MEMORY_LLM_JUDGE_ENABLED
       ),
-      memoryGuardLevel: normalizeMemoryGuardLevel(memoryGuardLevelRow?.value),
-      memoryUserMemoriesMaxItems: clampMemoryUserMemoriesMaxItems(Number(memoryUserMemoriesMaxItemsRow?.value)),
+      memoryGuardLevel: normalizeMemoryGuardLevel(configMap.get('memoryGuardLevel')),
+      memoryUserMemoriesMaxItems: clampMemoryUserMemoriesMaxItems(Number(configMap.get('memoryUserMemoriesMaxItems'))),
     };
   }
 

@@ -7,6 +7,8 @@ import {
   deleteSession as deleteSessionAction,
   deleteSessions as deleteSessionsAction,
   addMessage,
+  prependMessages,
+  setMessagePaginationState,
   updateMessageContent,
   setStreaming,
   setRemoteManaged,
@@ -459,18 +461,31 @@ class CoworkService {
     }
   }
 
-  async loadSession(sessionId: string): Promise<CoworkSession | null> {
+  async loadSession(sessionId: string, messageLimit = 100): Promise<CoworkSession | null> {
     const cowork = window.electron?.cowork;
     if (!cowork) return null;
     const requestId = ++this.latestLoadSessionRequestId;
 
     const result = await cowork.getSession(sessionId);
     if (result.success && result.session) {
-      // Keep only the latest session load result to avoid stale async overwrites.
       if (requestId !== this.latestLoadSessionRequestId) {
         return result.session;
       }
-      store.dispatch(setCurrentSession(result.session));
+
+      const totalMessages = result.session.messages.length;
+      let sessionToStore = result.session;
+
+      if (totalMessages > messageLimit) {
+        sessionToStore = {
+          ...result.session,
+          messages: result.session.messages.slice(-messageLimit),
+        };
+        store.dispatch(setCurrentSession(sessionToStore));
+        store.dispatch(setMessagePaginationState({ total: totalMessages, hasMore: true }));
+      } else {
+        store.dispatch(setCurrentSession(result.session));
+      }
+
       store.dispatch(setStreaming(result.session.status === 'running'));
 
       const imResult = await cowork.remoteManaged(sessionId);
@@ -478,11 +493,37 @@ class CoworkService {
         store.dispatch(setRemoteManaged(imResult?.remoteManaged ?? false));
       }
 
-      return result.session;
+      return sessionToStore;
     }
 
     console.error('Failed to load session:', result.error);
     return null;
+  }
+
+  async loadMoreMessages(sessionId: string, limit = 50): Promise<boolean> {
+    const cowork = window.electron?.cowork;
+    if (!cowork?.getMessages) return false;
+
+    const state = store.getState().cowork;
+    if (state.currentSession?.id !== sessionId) return false;
+
+    const currentCount = state.currentSession.messages.length;
+    const total = state.messageTotal;
+    const alreadyLoadedFromStart = total - currentCount;
+
+    if (alreadyLoadedFromStart <= 0) return false;
+
+    const offset = Math.max(0, alreadyLoadedFromStart - limit);
+    const fetchLimit = alreadyLoadedFromStart - offset;
+
+    const result = await cowork.getMessages({ sessionId, limit: fetchLimit, offset });
+    if (result.success && result.messages) {
+      store.dispatch(prependMessages({ sessionId, messages: result.messages, total }));
+      return true;
+    }
+
+    console.error('Failed to load more messages:', result.error);
+    return false;
   }
 
   async respondToPermission(requestId: string, result: CoworkPermissionResult): Promise<boolean> {

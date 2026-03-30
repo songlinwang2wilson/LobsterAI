@@ -1291,16 +1291,33 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const currentSession = useSelector((state: RootState) => state.cowork.currentSession);
   const isStreaming = useSelector((state: RootState) => state.cowork.isStreaming);
   const remoteManaged = useSelector((state: RootState) => state.cowork.remoteManaged);
+  const hasMoreMessages = useSelector((state: RootState) => state.cowork.hasMoreMessages);
   const skills = useSelector((state: RootState) => state.skill.skills);
   const detailRootRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
 
   // Clear lazy-render height cache when session changes
   const sessionId = currentSession?.id;
   useEffect(() => {
     clearHeightCache();
   }, [sessionId]);
+
+  const handleLoadMore = useCallback(async () => {
+    if (!sessionId || isLoadingMore || !hasMoreMessages) return;
+    const container = scrollContainerRef.current;
+    const prevScrollHeight = container?.scrollHeight ?? 0;
+    setIsLoadingMore(true);
+    await coworkService.loadMoreMessages(sessionId);
+    setIsLoadingMore(false);
+    if (container) {
+      requestAnimationFrame(() => {
+        const newScrollHeight = container.scrollHeight;
+        container.scrollTop += newScrollHeight - prevScrollHeight;
+      });
+    }
+  }, [sessionId, isLoadingMore, hasMoreMessages]);
 
   // Rail navigation states
   const [currentRailIndex, setCurrentRailIndex] = useState(-1);
@@ -2122,6 +2139,18 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
           onScroll={handleMessagesScroll}
           className={`h-full min-h-0 overflow-y-auto pt-3 ${turns.length > 1 && isScrollable ? 'pr-8' : 'pr-3'}`}
         >
+          {hasMoreMessages && (
+            <div className="flex justify-center py-2">
+              <button
+                type="button"
+                onClick={handleLoadMore}
+                disabled={isLoadingMore}
+                className="px-4 py-1.5 text-sm rounded-lg dark:text-claude-darkTextSecondary text-claude-textSecondary dark:hover:bg-claude-darkSurfaceHover hover:bg-claude-surfaceHover transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isLoadingMore ? i18nService.t('coworkLoadingMessages') : i18nService.t('coworkLoadMoreMessages')}
+              </button>
+            </div>
+          )}
           {renderConversationTurns()}
           <div className="h-20" />
         </div>

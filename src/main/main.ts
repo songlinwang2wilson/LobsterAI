@@ -2717,6 +2717,23 @@ if (!gotTheLock) {
     }
   });
 
+  ipcMain.handle('cowork:session:getMessages', async (_event, options: { sessionId: string; limit?: number; offset?: number }) => {
+    try {
+      const store = getCoworkStore();
+      const messages = store.getSessionMessagesPaginated(options.sessionId, {
+        limit: options.limit,
+        offset: options.offset,
+      });
+      const total = store.getSessionMessageCount(options.sessionId);
+      return { success: true, messages, total };
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to get messages',
+      };
+    }
+  });
+
   ipcMain.handle('cowork:session:remoteManaged', async (_event, sessionId: string) => {
     try {
       const mapping = getIMGatewayManager()?.getIMStore()?.getSessionMappingByCoworkSessionId(sessionId);
